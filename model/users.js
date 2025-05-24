@@ -1,36 +1,11 @@
-const users = [
-    {
-        id: 0,
-        username: 'johndoe',
-        password: 'password123',
-        refresh_token: '',
-        name: 'John Doe',
-        division: 'IT'
-    },
-    {
-        id: 1,
-        username: 'janecena321',
-        password: 'rawrr321',
-        refresh_token: '',
-        name: 'Jane Cena',
-        division: 'HR'
-    },
-    {
-        id: 2,
-        username: 'foofoofafa',
-        password: 'inipassword321',
-        refresh_token: '',
-        name: 'Foo Bar',
-        division: 'Marketing'
-    },
-    {
-        id: 3,
-        username: 'bazquux',
-        password: 'bombardilocrocodilo',
-        refresh_token: '',
-        name: 'Baz Quux',
-        division: 'Finance'
-    }
-]
+import { pgTable, serial, varchar, text, foreignKey } from "drizzle-orm/pg-core";
 
-export default users;
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  username: varchar("username", { length: 255 }).notNull(),
+  password: varchar("password", { length: 255 }).notNull(),
+  name: varchar("name", { length: 255 }).notNull(),
+  division: varchar("division", { length: 10 }).notNull(),
+  refresh_token: text("refresh_token"),
+  profile_picture_url: text("profile_picture_url"),
+});

@@ -1,28 +1,34 @@
 import jwt from "jsonwebtoken";
-import users from "../model/users.js";
+import { db } from "../db/db.js";
+import { users as usersTable } from "../model/users.js";
 import dotenv from "dotenv";
+import { eq } from "drizzle-orm";
+import { supabase } from "../db/supabase.js";
 
 dotenv.config();
 
-const getUsers = (req, res, next) => {
+const getUsers = async (req, res, next) => {
   try {
+    const allUsers = await db.select().from(usersTable);
     res.status(200).json({
       status: "success",
       message: "Successfully get all users",
-      data: users,
+      data: allUsers,
     });
   } catch (error) {
     console.log(error.message);
+    res.status(500).json({ message: error.message });
   }
 };
 
-const getUser = (req, res, next) => {
+const getUser = async (req, res, next) => {
   try {
     const { id } = req.params;
-
-    const user = users.find((user) => user.id == id);
-
-    if (!user) {
+    const user = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.id, Number(id)));
+    if (!user.length) {
       res.status(400).json({
         status: "error",
         message: `User with id ${id} not found`,
@@ -30,16 +36,17 @@ const getUser = (req, res, next) => {
     } else {
       res.status(200).json({
         status: "success",
-        message: "succuessfully get user",
-        user: user,
+        message: "Successfully get user",
+        user: user[0],
       });
     }
   } catch (error) {
     console.log(error.message);
+    res.status(500).json({ message: error.message });
   }
 };
 
-const register = (req, res, next) => {
+const register = async (req, res, next) => {
   try {
     const { username, password, name, division } = req.body;
 
@@ -48,27 +55,21 @@ const register = (req, res, next) => {
         message: "Username and password are required",
       });
     }
-
-    // Cek apakah user sudah ada
-    const existingUser = users.find((u) => u.username === username);
-    if (existingUser) {
-      return res.status(409).json({
-        message: "User already exists",
-      });
+    // Check if user exists
+    const existingUser = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.username, username));
+    if (existingUser.length) {
+      return res.status(409).json({ message: "User already exists" });
     }
-
-    // Buat user baru
-    const newUser = {
-      id: users.length,
-      username,
-      password, // plain text
-      refresh_token: "",
-      name: name || "",
-      division: division || "",
-    };
-    users.push(newUser);
-
-    // Hapus data sensitif sebelum membuat token
+    // Insert new user
+    const inserted = await db
+      .insert(usersTable)
+      .values({ username, password, name, division })
+      .returning();
+    const newUser = inserted[0];
+    // Remove sensitive data
     const { password: _, refresh_token: __, ...safeUserData } = newUser;
 
     // Generate JWT token
@@ -80,15 +81,16 @@ const register = (req, res, next) => {
       process.env.REFRESH_KEY_SECRET,
       { expiresIn: "3d" }
     );
-
-    // Simpan refresh token ke user
-    newUser.refresh_token = refreshToken;
-
+    // Update refresh token in db
+    await db
+      .update(usersTable)
+      .set({ refresh_token: refreshToken })
+      .where(eq(usersTable.id, newUser.id));
     res.cookie("refresh_token", refreshToken, {
       httpOnly: true,
       secure: true,
       sameSite: "none",
-      maxAge: 3 * 24 * 60 * 60 * 1000, // 3 hari
+      maxAge: 3 * 24 * 60 * 60 * 1000,
     });
 
     return res.status(201).json({
@@ -103,89 +105,126 @@ const register = (req, res, next) => {
   }
 };
 
-const deleteUser = (req, res, next) => {
+// Delete user
+const deleteUser = async (req, res, next) => {
   try {
     const { id } = req.params;
-
-    const targetedUser = users.findIndex((user) => user.id == id);
-
-    if (targetedUser == -1) {
+    const deleted = await db
+      .delete(usersTable)
+      .where(eq(usersTable.id, id))
+      .returning();
+    if (!deleted.length) {
       res.status(400).json({
         status: "error",
         message: `User with id ${id} not found`,
       });
     } else {
-      users.splice(targetedUser, 1);
-
       res.status(200).json({
         status: "success",
         message: "Successfully delete user",
-        data: users,
       });
     }
   } catch (error) {
     console.log(error.message);
+    res.status(500).json({ message: error.message });
   }
 };
 
-const editUser = (req, res, next) => {
+// Edit user
+const editUser = async (req, res, next) => {
   try {
-    const { id, name, division } = req.body;
+    const { id } = req.params;
+    const { name, division } = req.body;
+    let profilePictureUrl;
 
-    const targetedUser = users.findIndex((user) => user.id == id);
+    if (req.file) {
+      const file = req.file;
+      const fileName = `profile-pictures/${id}`;
 
-    if (targetedUser === -1) {
-      res.status(400).json({
+      const { data: uploadData, error: uploadError } = await supabase.storage
+        .from(process.env.SUPABASE_BUCKET)
+        .upload(fileName, file.buffer, {
+          contentType: file.mimetype,
+        });
+
+      if (uploadError) {
+        console.error("Supabase upload error:", uploadError);
+        return res
+          .status(500)
+          .json({ message: "Error uploading file to Supabase." });
+      }
+
+      const { data: publicUrlData } = supabase.storage
+        .from(process.env.SUPABASE_BUCKET)
+        .getPublicUrl(fileName);
+
+      if (!publicUrlData || !publicUrlData.publicUrl) {
+        return res
+          .status(500)
+          .json({ message: "Error getting public URL from Supabase." });
+      }
+      profilePictureUrl = publicUrlData.publicUrl;
+    }
+
+    const updateData = {};
+    if (name) updateData.name = name;
+    if (division) updateData.division = division;
+    if (profilePictureUrl) updateData.profile_picture_url = profilePictureUrl;
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ message: "No update data provided." });
+    }
+
+    const updated = await db
+      .update(usersTable)
+      .set(updateData)
+      .where(eq(usersTable.id, Number(id)))
+      .returning();
+
+    if (!updated.length) {
+      return res.status(404).json({
+        // Changed to 404 for not found
         status: "error",
         message: `User with id ${id} not found`,
       });
-    } else {
-      users[targetedUser] = {
-        id: targetedUser,
-        name: name,
-        division: division,
-      };
-
-      res.status(200).json({
-        status: "success",
-        message: "Successfully update user",
-        data: users,
-      });
     }
+
+    // Remove sensitive data before sending response
+    const { password: _, refresh_token: __, ...safeUserData } = updated[0];
+
+    res.status(200).json({
+      status: "success",
+      message: "Successfully update user",
+      data: safeUserData, // Send back the updated user data (without password/token)
+    });
   } catch (error) {
     console.log(error.message);
+    res.status(500).json({ message: error.message });
   }
 };
 
-const login = (req, res) => {
+// Login
+const login = async (req, res) => {
   try {
     const { username, password } = req.body;
-
     if (!username || !password) {
-      return res.status(400).json({
-        message: "Username and password are required",
-      });
+      return res
+        .status(400)
+        .json({ message: "Username and password are required" });
     }
+    const userArr = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.username, username));
 
-    // Cari user berdasarkan username
-    const user = users.find((u) => u.username === username);
+    const user = userArr[0];
     if (!user) {
-      return res.status(404).json({
-        message: "User not found",
-      });
+      return res.status(404).json({ message: "User not found" });
     }
-
-    // Cek password (plain text)
     if (user.password !== password) {
-      return res.status(401).json({
-        message: "Invalid password",
-      });
+      return res.status(401).json({ message: "Invalid password" });
     }
-
-    // Hapus data sensitif sebelum membuat token
     const { password: _, refresh_token: __, ...safeUserData } = user;
-
-    // Generate JWT token
     const accessToken = jwt.sign(safeUserData, process.env.ACCESS_KEY_SECRET, {
       expiresIn: "30s",
     });
@@ -194,17 +233,16 @@ const login = (req, res) => {
       process.env.REFRESH_KEY_SECRET,
       { expiresIn: "3d" }
     );
-
-    // Simpan refresh token ke user
-    user.refresh_token = refreshToken;
-
+    await db
+      .update(usersTable)
+      .set({ refresh_token: refreshToken })
+      .where(eq(usersTable.id, user.id));
     res.cookie("refresh_token", refreshToken, {
       httpOnly: true,
       secure: true,
       sameSite: "none",
-      maxAge: 3 * 24 * 60 * 60 * 1000, // 3 hari
+      maxAge: 3 * 24 * 60 * 60 * 1000,
     });
-
     return res.status(200).json({
       message: "Login successful",
       accessToken,
@@ -217,43 +255,38 @@ const login = (req, res) => {
   }
 };
 
+// Get new access token from refresh token
 const getToken = async (req, res) => {
   try {
     const refreshToken = req.cookies.refresh_token;
     if (!refreshToken) {
-      const error = new Error("Refresh token tidak ada");
-      error.statusCode = 401;
-      throw error;
+      return res.status(401).json({
+        status: "Error",
+        message: "Refresh token tidak ada",
+      });
     }
-
-    // Cari user di array users
-    const user = users.find((u) => u.refresh_token === refreshToken);
-
+    const userArr = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.refresh_token, refreshToken));
+    const user = userArr[0];
     if (!user || !user.refresh_token) {
-      const error = new Error("Refresh token tidak ada");
-      error.statusCode = 401;
-      throw error;
+      return res.status(401).json({
+        status: "Error",
+        message: "Refresh token tidak ada",
+      });
     }
-
-    // Kalo ketemu, verifikasi refresh token
     jwt.verify(
-      refreshToken, // <- refresh token yg mau diverifikasi
-      process.env.REFRESH_KEY_SECRET, // <- Secret key dari refresh token
+      refreshToken,
+      process.env.REFRESH_KEY_SECRET,
       (error, decoded) => {
-        // Jika ada error (access token tidak valid/kadaluarsa), kirim respons error
         if (error) {
           return res.status(403).json({
             status: "Error",
             message: "Refresh token tidak valid",
           });
         }
-        // Konversi data user ke bentuk object
-        const userPlain = user.toJSON();
-
-        // Hapus data sensitif sebelum membuat token baru, dalam hal ini password sama refresh token dihapus
-        const { password: _, refresh_token: __, ...safeUserData } = userPlain;
-
-        // Buat access token baru (expire selama 30 detik)
+        const { password: _, refresh_token: __, ...safeUserData } = user;
         const accessToken = jwt.sign(
           safeUserData,
           process.env.ACCESS_KEY_SECRET,
@@ -261,12 +294,10 @@ const getToken = async (req, res) => {
             expiresIn: "30s",
           }
         );
-
-        // Kirim respons sukses + kasih access token yg udah dibikin tadi
         return res.status(200).json({
           status: "Success",
           message: "Berhasil mendapatkan access token.",
-          accessToken, // <- Access token baru untuk client
+          accessToken,
         });
       }
     );
@@ -278,7 +309,8 @@ const getToken = async (req, res) => {
   }
 };
 
-const logout = (req, res) => {
+// Logout
+const logout = async (req, res) => {
   try {
     const refreshToken = req.cookies.refresh_token;
     if (!refreshToken) {
@@ -287,11 +319,12 @@ const logout = (req, res) => {
         message: "No refresh token provided",
       });
     }
-
-    // Find user by refresh token
-    const user = users.find((u) => u.refresh_token === refreshToken);
+    const userArr = await db
+      .select()
+      .from(usersTable)
+      .where(eq(usersTable.refresh_token, refreshToken));
+    const user = userArr[0];
     if (!user) {
-      // Still clear cookie for security
       res.clearCookie("refresh_token", {
         httpOnly: true,
         secure: true,
@@ -302,17 +335,15 @@ const logout = (req, res) => {
         message: "Invalid refresh token",
       });
     }
-
-    // Remove refresh token from user object
-    user.refresh_token = "";
-
-    // Clear refresh token cookie
+    await db
+      .update(usersTable)
+      .set({ refresh_token: "" })
+      .where(eq(usersTable.id, user.id));
     res.clearCookie("refresh_token", {
       httpOnly: true,
       secure: true,
       sameSite: "none",
     });
-
     return res.status(200).json({
       status: "success",
       message: "Logged out successfully",
